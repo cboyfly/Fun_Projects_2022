@@ -1,0 +1,176 @@
+---
+title: "STOR 565 Final Project log model copy"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(caret)
+library(glmnet)
+library(dplyr)
+library(tidyverse)
+library(smotefamily)
+
+```
+
+```{r}
+df<- read.csv("565dataset.csv")
+head(df)
+df <- subset(df, select=-c(Applicant_ID))
+str(df)
+cols=names(Filter(is.character, df)) %>% unlist()
+
+```
+So these columns are characters. Let's convert these to factors.
+
+```{r}
+head(df)
+cols
+df[cols]<-lapply(df[cols], factor)
+sapply(df, levels) 
+df %>% dplyr::summarise_each(funs(list(levels(.))))
+```
+So now we know the levels for each factor column in our dataframe. Education type is ordinal (with respect to the data set, higher education level generally means higher rates of eligibility) and all other factor variables are nominal. We will employ label encoding to education type. Since family status, housing type, and income type do not have many levels (<10 levels each), I will one hot encode them. Same for applicant gender.
+
+```{r}
+education.col<- df$Education_Type #save for if we need column later
+df<-subset(df, select = -c(Education_Type))
+education.levels<- c("Academic degree","Higher education","Incomplete higher","Lower secondary","Secondary / secondary special")
+df$education.ordered<- factor(education.col, levels = education.levels) %>% as.numeric()
+head(df)
+dummmy <- dummyVars(" ~ .", data = df)
+data<-data.frame(predict(dummmy, newdata = df))
+colnames(data)
+# To avoid the dummy variable trap, I will drop the Applicant_Gender.M column.
+data$Applicant_Gender.M<- NULL
+#data$Status<-c('no','yes')[data$Status+1]
+head(data)
+```
+
+Now that we have prepared our features, we can split the data and begin building the models.
+```{r}
+set.seed(12345)
+indexes<- sample(1:nrow(data), 0.8*nrow(data))
+train<- data[indexes,]
+test<- data[-indexes,]
+hist(data$Status)
+dim(train)
+table(data$Status)
+train$Status<- train$Status %>% as.factor()
+```
+Note the classes are quite unbalanced- the number of eligible persons in the training set is more than 200 times the number of non-eligible persons. To address this imbalance, we use Synthetic Minority Oversampling Technique, or SMOTE for short. SMOTE selects an observation from the minority class at random, then selects k of its nearest neighbors also from the minority class. Then a new synthetic minority class observation is formed as a combination the two instances (He, Haibo, and Yunqian Ma.).
+
+```{r}
+set.seed(20216)
+train<- SMOTE.DMwR(Status ~., train, perc.over = 3000, k= 5, perc.under = 600)
+#train<- smote$data
+#train$Status<- train$class %>% as.numeric()
+#train$class<- NULL
+table(train$Status)
+dim(train)
+cols_to_scale<- c('Total_Income','Applicant_Age', 'Years_of_Working', 'Total_Bad_Debt','Total_Good_Debt', 'Months_Overdue', 'Months_PaidOff')
+
+
+standardized<- preProcess(train[cols_to_scale], method = c("center", "scale"))
+train[cols_to_scale]<- predict(standardized, train[cols_to_scale])
+test[cols_to_scale]<- predict(standardized, test[cols_to_scale])
+
+```
+Now we have 40,000 observations total in the training set, with a fairly even split between classes. So we can proceed to building and testing the models. 
+
+```{r}
+y.train<- train$Status
+x.train<-train %>% select(-Status) %>% data.matrix()
+y.test<- test$Status
+x.test<- test %>% select(-Status) %>% data.matrix()
+
+lasso.cv<-cv.glmnet(x.train, y.train, alpha = 1, family="binomial", nfolds=5)
+ridge.cv<-cv.glmnet(x.train, y.train, alpha = 0, family="binomial", nfolds=5)
+nelnet.cv<-cv.glmnet(x.train, y.train, alpha = .5, family="binomial", nfolds=5)
+
+lambda.lasso<-lasso.cv$lambda.1se
+lambda.ridge<-ridge.cv$lambda.1se
+lambda.nelnet<-nelnet.cv$lambda.1se
+
+lasso.predictions = predict(lasso.cv, s='lambda.1se', newx=x.test, type="class")
+ridge.predictions= predict(ridge.cv, s='lambda.1se', newx=x.test, type="class")
+nelnet.predictions= predict(nelnet.cv, s='lambda.1se', newx=x.test, type="class")
+
+table.lasso <- table(Predicted = lasso.predictions, Actual = y.test)
+table.ridge <- table(Predicted = ridge.predictions, Actual = y.test)
+table.nelnet <- table(Predicted = nelnet.predictions, Actual = y.test)
+table.lasso
+table.ridge
+table.nelnet
+lasso.accuracy<-mean(lasso.predictions==y.test)
+ridge.accuracy<-mean(ridge.predictions==y.test)
+nelnet.accuracy<-mean(nelnet.predictions==y.test)
+lasso.accuracy
+ridge.accuracy
+nelnet.accuracy
+```
+
+```{r}
+#Lasso Precision:
+lasso.precision<-(table.lasso[1,1]/sum(table.lasso[1,1:2]))*100
+lasso.precision
+
+ridge.precision<-(table.ridge[1,1]/sum(table.ridge[1,1:2]))*100
+ridge.precision
+
+nelnet.precision<-(table.nelnet[1,1]/sum(table.nelnet[1,1:2]))*100
+nelnet.precision
+
+lasso.sensitivity<-(table.lasso[2,2]/sum(colSums(table.lasso)[2]))*100
+lasso.sensitivity
+
+ridge.sensitivity<-(table.ridge[2,2]/sum(colSums(table.ridge)[2]))*100
+ridge.sensitivity
+
+nelnet.sensitivity<-(table.nelnet[2,2]/sum(colSums(table.nelnet)[2]))*100
+nelnet.sensitivity
+
+lasso.specificity<-(table.lasso[1,1]/sum(colSums(table.lasso)[1]))*100
+lasso.specificity
+
+ridge.specificity<-(table.ridge[1,1]/sum(colSums(table.ridge)[1]))*100
+ridge.specificity
+
+nelnet.specificity<-(table.nelnet[1,1]/sum(colSums(table.nelnet)[1]))*100
+nelnet.specificity
+
+```
+
+Cross Validation plots for each model, as well as the coefficients for the models:
+```{r}
+plot(lasso.cv, main = "Lasso CV plot")
+plot(ridge.cv, main = "Elastic Net CV plot")
+plot(nelnet.cv, main = "Elastic Net CV plot")
+
+coef(lasso.cv)
+coef(ridge.cv)
+coef(nelnet.cv)
+
+
+sum((coef(lasso.cv)!=0)) 
+sum((coef(nelnet.cv)!=0)) 
+```
+
+Ordinary Logistic Regression overfits the data. This is why we tried penalized logistic regression.
+```{r}
+glm(Status~., data =train, family = 'binomial' )
+```
+
+```{r}
+library(ggplot2)
+ggplot(df, aes(x=Status))+
+  geom_histogram(color='#000000', fill="white")
+```
+
+
+WORKS CITED:
+He, Haibo, and Yunqian Ma. "Imbalanced learning: Foundations, algorithms, and applications." Imbalanced Learning: Foundations, Algorithms, and Applications , (2013): 1-210. doi:10.1002/9781118646106.
+
